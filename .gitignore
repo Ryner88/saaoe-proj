@@ -126,3 +126,7 @@ node_modules/
 
 # Logs
 *.log
+
+# Virtual environments
+venv/
+.venv/
