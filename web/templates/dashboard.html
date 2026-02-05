@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SAAOE • Live System Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='saaoe.css') }}">
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="title">
+        SAAOE • Live System Dashboard
+        <span id="modeBadge" class="badge">MODE: LIVE</span>
+      </div>
+      <div class="controls" role="toolbar" aria-label="Dashboard controls">
+        <label class="label">Refresh
+          <select id="refreshMs" aria-label="Refresh interval">
+            <option value="1000">1s</option>
+            <option value="5000">5s</option>
+            <option value="10000">10s</option>
+            <option value="60000" selected>1m</option>
+          </select>
+        </label>
+        <label class="label">Chart height
+          <select id="chartSize" aria-label="Chart height">
+            <option value="64">Large (64px)</option>
+            <option value="80" selected>XL (80px)</option>
+            <option value="120">XXL (120px)</option>
+            <option value="160">Ultra (160px)</option>
+          </select>
+        </label>
+        <label class="label"><input id="autoScale" type="checkbox" checked /> Auto-scale</label>
+        <label class="label">Density
+          <select id="density" aria-label="Density">
+            <option value="ultra">Ultra</option>
+            <option value="compact">Compact</option>
+            <option value="normal" selected>Normal</option>
+          </select>
+        </label>
+        <button id="zoomAllBtn" class="btn" aria-label="Zoom all charts">Zoom All</button>
+        <button id="pauseBtn" class="btn" aria-label="Pause updates">Pause</button>
+        <button id="exportBtn" class="btn" aria-label="Export CSV">Export CSV</button>
+        <button id="themeToggle" class="btn" aria-label="Toggle theme">Toggle Theme</button>
+        <button id="toggleMode" class="btn" aria-label="Toggle mock/live">Use MOCK</button>
+        <span class="label">Status <span id="connDot" class="dot"></span></span>
+        <span id="lastUpdated" class="label">—</span>
+      </div>
+    </header>
+
+    <!-- Top stats + charts -->
+    <section class="grid">
+      <div class="card">
+        <div class="label">CPU Usage (latest)</div>
+        <div class="big" id="cpuNow">--</div>
+        <div id="cpuWrap" class="chart" title="Double-click to zoom"><canvas id="cpuChart"></canvas></div>
+      </div>
+
+      <div class="card">
+        <div class="label">Memory Usage (latest)</div>
+        <div class="big" id="memNow">--</div>
+        <div id="memWrap" class="chart" title="Double-click to zoom"><canvas id="memChart"></canvas></div>
+      </div>
+
+      <div class="card">
+        <div class="label">Disk Read / Write (latest)</div>
+        <div class="big" id="diskRW">-- / --</div>
+        <div id="diskWrap" class="chart" title="Double-click to zoom"><canvas id="diskChart"></canvas></div>
+      </div>
+
+      <div class="card">
+        <div class="label">Net RX / TX (latest)</div>
+        <div class="big" id="netNow">-- / --</div>
+        <div id="netWrap" class="chart" title="Double-click to zoom"><canvas id="netChart"></canvas></div>
+      </div>
+    </section>
+
+    <!-- Processes / temps / gpu -->
+    <section class="grid" style="margin-top:10px;">
+      <div class="card" style="grid-column: span 2;">
+        <div class="label">Top Processes (CPU% / RAM MB)</div>
+        <table class="table" id="procTable">
+          <thead><tr><th>PID</th><th>Name</th><th>User</th><th class="num">CPU%</th><th class="num">RAM (MB)</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div class="help">Updated: <span id="procUpdated">—</span></div>
+      </div>
+      <div class="card">
+        <div class="label">Temperatures (°C)</div>
+        <div id="tempsBox" class="help">—</div>
+      </div>
+      <div class="card">
+        <div class="label">GPU</div>
+        <div id="gpuBox" class="help">—</div>
+      </div>
+    </section>
+
+    <div class="footer">Backed by <code>/api/usage</code>, <code>/api/disk</code>, <code>/api/net</code>, <code>/api/procs</code>, <code>/api/temps</code>, <code>/api/gpu</code>.</div>
+  </div>
+
+  <!-- Zoom All overlay -->
+  <div id="zoomOverlay" class="overlay" aria-hidden="true">
+    <div class="modal" role="dialog" aria-modal="true" aria-label="Zoomed charts">
+      <div class="head">
+        <div class="label">Zoomed charts (Esc to close)</div>
+        <button id="closeZoom" class="btn">Close</button>
+      </div>
+      <div class="grid charts">
+        <div class="card"><div class="label">CPU %</div><div class="chart"><canvas id="cpuChartZ"></canvas></div></div>
+        <div class="card"><div class="label">Memory %</div><div class="chart"><canvas id="memChartZ"></canvas></div></div>
+        <div class="card"><div class="label">Disk MB/s</div><div class="chart"><canvas id="diskChartZ"></canvas></div></div>
+        <div class="card"><div class="label">Net MB/s</div><div class="chart"><canvas id="netChartZ"></canvas></div></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+  document.addEventListener('DOMContentLoaded', () => {
+    const root = document.documentElement;
+    const $ = (id) => document.getElementById(id);
+    const last = (v, d=null) => Array.isArray(v) ? (v.length ? v[v.length-1] : d) : (v ?? d);
+    const clamp = (n,a,b)=>Math.min(b,Math.max(a,n));
+    const fmt = (n,d=1)=>(n==null||isNaN(n)?'--':Number(n).toFixed(d));
+    const fmtRateMB = (v)=> (v==null||isNaN(v))?'--':(v<1? (v*1024).toFixed(1)+' KB/s' : v>=1024? (v/1024).toFixed(2)+' GB/s' : v.toFixed(1)+' MB/s');
+    const cssVar = (n)=>getComputedStyle(root).getPropertyValue(n).trim();
+
+    // --- Preferences & controls ---
+    const densityPref = localStorage.getItem('saaoe-density') || 'normal';
+    const sizePref = localStorage.getItem('saaoe-chart-h') || '80';
+    const autoScalePref = localStorage.getItem('saaoe-autoscale') ?? '1';
+    $('density').value = densityPref;
+    $('chartSize').value = sizePref;
+    $('autoScale').checked = autoScalePref === '1';
+
+    function applyDensity(mode){
+      const cfg = {ultra:{pad:8,gap:8,big:16,label:10},compact:{pad:10,gap:10,big:18,label:11},normal:{pad:14,gap:12,big:22,label:12}}[mode] || {pad:14,gap:12,big:22,label:12};
+      root.style.setProperty('--card-pad', cfg.pad+'px');
+      root.style.setProperty('--grid-gap', cfg.gap+'px');
+      root.style.setProperty('--big-font', cfg.big+'px');
+      root.style.setProperty('--label-font', cfg.label+'px');
+      localStorage.setItem('saaoe-density', mode);
+    }
+    function applyChartSize(px){ root.style.setProperty('--chart-h',(Number(px)||80)+'px'); localStorage.setItem('saaoe-chart-h', String(px)); window.dispatchEvent(new Event('resize')); }
+
+    applyDensity($('density').value);
+    applyChartSize($('chartSize').value);
+
+    $('density').addEventListener('change',e=>applyDensity(e.target.value));
+    $('chartSize').addEventListener('change',e=>applyChartSize(e.target.value));
+    $('autoScale').addEventListener('change',e=>{ localStorage.setItem('saaoe-autoscale', e.target.checked?'1':'0'); });
+
+    $('themeToggle').addEventListener('click', () => {
+      const cur = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      root.setAttribute('data-theme', cur);
+      localStorage.setItem('saaoe-theme', cur);
+      applyChartTheme();
+    });
+
+    // --- Series ---
+    const MAX=240, MAX_CHART=120;
+    const series = { cpu:[], memory:[], read:[], write:[], rx:[], tx:[], t:[] };
+    function pushSeries(cpu,mem,read,write,rx,tx){
+      const push = (arr,v)=>{arr.push(v); if(arr.length>MAX) arr.shift();};
+      push(series.cpu,cpu); push(series.memory,mem); push(series.read,read);
+      push(series.write,write); push(series.rx,rx); push(series.tx,tx);
+      push(series.t,new Date().toLocaleTimeString());
+    }
+
+    // --- Charts ---
+    let cpuChart, memChart, diskChart, netChart;
+    let cpuChartZ, memChartZ, diskChartZ, netChartZ; // zoom copies
+
+    function chartTheme(){
+      return { grid: cssVar('--border')||'#1f2937', text: cssVar('--muted')||'#9fb0c3',
+               cpu: cssVar('--accent')||'#3b82f6', mem: cssVar('--good')||'#22c55e',
+               read: cssVar('--accent')||'#3b82f6', write: cssVar('--warn')||'#f59e0b',
+               rx: cssVar('--accent')||'#3b82f6', tx: cssVar('--good')||'#22c55e' };
+    }
+    function clampLen(ch){ while(ch.data.labels.length>MAX_CHART){ ch.data.labels.shift(); ch.data.datasets.forEach(ds=>ds.data.shift()); } }
+
+    function baseOpts(){
+      const c = chartTheme();
+      return {
+        animation:false, responsive:true, maintainAspectRatio:false,
+        scales:{
+          x:{ ticks:{ color:c.text, font:{size:11} }, grid:{ color:c.grid } },
+          y:{ beginAtZero:true, ticks:{ color:c.text, font:{size:11},
+                callback:(v)=>v }, grid:{ color:c.grid } }
+        },
+        plugins:{ legend:{ display:false },
+          tooltip:{ mode:'nearest', intersect:false,
+            callbacks:{ label: ctx => {
+              const y=ctx.parsed.y, lbl=ctx.dataset.label;
+              if (/MB\/s|RX|TX/.test(lbl)) return `${lbl}: ${fmtRateMB(y)}`;
+              if (/CPU|Memory/.test(lbl))  return `${lbl}: ${fmt(y,1)}%`;
+              return `${lbl}: ${fmt(y,2)}`;
+            }}} },
+        elements:{ line:{ borderWidth:2 }, point:{ radius:0 } }
+      };
+    }
+
+    function makeCharts(ctxs){
+      const c=chartTheme(), opts=baseOpts();
+      cpuChart = new Chart(ctxs.cpu,{type:'line',
+        data:{labels:[],datasets:[{label:'CPU %',data:[],borderColor:c.cpu,fill:false,tension:0.25}]},
+        options: JSON.parse(JSON.stringify(opts))});
+      cpuChart.options.scales.y.suggestedMax=100;
+
+      memChart = new Chart(ctxs.mem,{type:'line',
+        data:{labels:[],datasets:[{label:'Memory %',data:[],borderColor:c.mem,fill:false,tension:0.25}]},
+        options: JSON.parse(JSON.stringify(opts))});
+      memChart.options.scales.y.suggestedMax=100;
+
+      diskChart = new Chart(ctxs.disk,{type:'line',
+        data:{labels:[],datasets:[
+          {label:'Read MB/s',data:[],borderColor:c.read,fill:false,tension:0.25},
+          {label:'Write MB/s',data:[],borderColor:c.write,fill:false,tension:0.25}
+        ]}, options: JSON.parse(JSON.stringify(opts))});
+      diskChart.options.scales.y.ticks.callback=(v)=>fmtRateMB(v);
+
+      netChart = new Chart(ctxs.net,{type:'line',
+        data:{labels:[],datasets:[
+          {label:'RX MB/s',data:[],borderColor:c.rx,fill:false,tension:0.25},
+          {label:'TX MB/s',data:[],borderColor:c.tx,fill:false,tension:0.25}
+        ]}, options: JSON.parse(JSON.stringify(opts))});
+      netChart.options.scales.y.ticks.callback=(v)=>fmtRateMB(v);
+    }
+
+    function applyChartTheme(){
+      const c=chartTheme();
+      [cpuChart,memChart,diskChart,netChart,cpuChartZ,memChartZ,diskChartZ,netChartZ].forEach(ch=>{
+        if(!ch) return;
+        ch.options.scales.x.ticks.color=c.text;
+        ch.options.scales.y.ticks.color=c.text;
+        ch.options.scales.x.grid.color=c.grid;
+        ch.options.scales.y.grid.color=c.grid;
+        (ch.data.datasets[0]||{}).borderColor = c.cpu;
+        ch.update();
+      });
+      if (diskChart){ diskChart.data.datasets[0].borderColor=c.read; diskChart.data.datasets[1].borderColor=c.write; diskChart.update(); }
+      if (netChart){ netChart.data.datasets[0].borderColor=c.rx;   netChart.data.datasets[1].borderColor=c.tx;   netChart.update(); }
+      if (diskChartZ){ diskChartZ.data.datasets[0].borderColor=c.read; diskChartZ.data.datasets[1].borderColor=c.write; diskChartZ.update(); }
+      if (netChartZ){ netChartZ.data.datasets[0].borderColor=c.rx;   netChartZ.data.datasets[1].borderColor=c.tx;   netChartZ.update(); }
+    }
+
+    function pushCharts(label,cpu,mem,read,write,rx,tx){
+      const autoscale = $('autoScale').checked;
+      const feed = (ch, arrs)=>{
+        ch.data.labels.push(label);
+        arrs.forEach((a,i)=>ch.data.datasets[i].data.push(a));
+        clampLen(ch);
+        if (autoscale){
+          const all = ch.data.datasets.flatMap(ds=>ds.data);
+          const max = Math.max(0.5, ...all);
+          ch.options.scales.y.suggestedMax = ch===cpuChart||ch===memChart ? Math.max(100, max) : max*1.3;
+        } else {
+          if (ch===cpuChart || ch===memChart) ch.options.scales.y.suggestedMax = 100;
+        }
+        ch.update('none');
+      };
+      feed(cpuChart,[cpu]);
+      feed(memChart,[mem]);
+      feed(diskChart,[read,write]);
+      feed(netChart,[rx,tx]);
+
+      // If zoom-all is open, mirror into Z charts
+      if (cpuChartZ){
+        cpuChartZ.data.labels = cpuChart.data.labels.slice();
+        memChartZ.data.labels = memChart.data.labels.slice();
+        diskChartZ.data.labels= diskChart.data.labels.slice();
+        netChartZ.data.labels = netChart.data.labels.slice();
+        cpuChartZ.data.datasets[0].data = cpuChart.data.datasets[0].data.slice();
+        memChartZ.data.datasets[0].data = memChart.data.datasets[0].data.slice();
+        diskChartZ.data.datasets[0].data= diskChart.data.datasets[0].data.slice();
+        diskChartZ.data.datasets[1].data= diskChart.data.datasets[1].data.slice();
+        netChartZ.data.datasets[0].data = netChart.data.datasets[0].data.slice();
+        netChartZ.data.datasets[1].data = netChart.data.datasets[1].data.slice();
+        cpuChartZ.update('none'); memChartZ.update('none'); diskChartZ.update('none'); netChartZ.update('none');
+      }
+    }
+
+    function draw(){
+      $('cpuNow').textContent = fmt(last(series.cpu)) + '%';
+      $('memNow').textContent = fmt(last(series.memory)) + '%';
+      $('diskRW').textContent = `${fmtRateMB(last(series.read))} / ${fmtRateMB(last(series.write))}`;
+      $('netNow').textContent  = `${fmtRateMB(last(series.rx))} / ${fmtRateMB(last(series.tx))}`;
+      $('lastUpdated').textContent = 'Last updated ' + new Date().toLocaleTimeString();
+    }
+
+    // --- LIVE / MOCK data ---
+    let mode='live', paused=false, timer=null;
+    let mock={cpu:8,mem:19.5,read:0,write:0,rx:0,tx:0};
+    function stepMock(){
+      mock.cpu = clamp(mock.cpu+(Math.random()-0.5)*3,0,100);
+      mock.mem = clamp(mock.mem+(Math.random()-0.5)*0.3,12,30);
+      const sd=Math.random()<0.06, sn=Math.random()<0.08;
+      mock.read = sd?Math.random()*20:Math.random()*0.3;
+      mock.write= sd?Math.random()*15:Math.random()*0.25;
+      mock.rx   = sn?Math.random()*10:Math.random()*0.25;
+      mock.tx   = sn?Math.random()*10:Math.random()*0.25;
+    }
+
+    async function fetchLive(){
+      const ctrl=new AbortController(); const to=setTimeout(()=>ctrl.abort(),4000);
+      try{
+        const [u,d,n]=await Promise.all([
+          fetch('/api/usage',{signal:ctrl.signal}),
+          fetch('/api/disk',{signal:ctrl.signal}),
+          fetch('/api/net',{signal:ctrl.signal})
+        ]);
+        if(!u.ok||!d.ok||!n.ok) throw 0;
+        const [U,D,N]=await Promise.all([u.json(),d.json(),n.json()]);
+        const c=last(U.cpu), m=last(U.memory), r=last(D.read), w=last(D.write), rx=last(N.rx), tx=last(N.tx);
+        pushSeries(+c,+m,+r,+w,+rx,+tx);
+        $('connDot').style.background='var(--good)';
+        // fetch side-panels
+        fetch('/api/procs?limit=12').then(r=>r.json()).then(drawProcs).catch(()=>{});
+        fetch('/api/temps').then(r=>r.json()).then(drawTemps).catch(()=>{});
+        fetch('/api/gpu').then(r=>r.json()).then(drawGpu).catch(()=>{});
+        return true;
+      }catch{ $('connDot').style.background='var(--warn)'; return false; }
+      finally{ clearTimeout(to); }
+    }
+
+    function drawProcs(data){
+      $('procUpdated').textContent = data.updated || '—';
+      const tb = $('procTable').querySelector('tbody'); tb.innerHTML='';
+      (data.rows||[]).forEach(r=>{
+        const tr=document.createElement('tr');
+        tr.innerHTML = `<td>${r.pid}</td><td>${r.name}</td><td>${r.user}</td>
+                        <td class="num">${fmt(r.cpu,1)}</td><td class="num">${fmt(r.mem_mb,1)}</td>`;
+        tb.appendChild(tr);
+      });
+    }
+    function drawTemps(data){
+      const box=$('tempsBox'), s=data.sensors||{}; if(!Object.keys(s).length){ box.textContent='No sensors available'; return; }
+      box.innerHTML = Object.entries(s).map(([k,arr])=>{
+        const rows=(arr||[]).map(t=>`${t.label||'sensor'}: ${t.current??'--'}°C${t.high?' (high '+t.high+'°C':''}${t.critical?', crit '+t.critical+'°C':''}${(t.high||t.critical)?')':''}`).join('<br>');
+        return `<div style="margin-bottom:6px;"><strong>${k}</strong><br>${rows}</div>`;
+      }).join('');
+    }
+    function drawGpu(data){
+      const box=$('gpuBox'), g=data.gpus||[]; if(!g.length){ box.textContent='No GPU detected (or GPUtil not installed)'; return; }
+      box.innerHTML = g.map(x=>`<div style="margin-bottom:6px;"><strong>${x.name}</strong> — ${fmt(x.load,1)}% • ${x.temperature??'--'}°C<br>VRAM: ${fmt(x.mem_used,0)} / ${fmt(x.mem_total,0)} MB (free ${fmt(x.mem_free,0)} MB)</div>`).join('');
+    }
+
+    function startPolling(ms){ if(timer) clearInterval(timer); if(paused) return; tick(); timer=setInterval(tick,ms); }
+    async function tick(){
+      if(paused) return;
+      if(mode==='live'){ const ok=await fetchLive(); if(!ok){ stepMock(); pushSeries(mock.cpu,mock.mem,mock.read,mock.write,mock.rx,mock.tx); } }
+      else { stepMock(); pushSeries(mock.cpu,mock.mem,mock.read,mock.write,mock.rx,mock.tx); }
+      draw();
+      const lbl=last(series.t);
+      pushCharts(lbl,last(series.cpu),last(series.memory),last(series.read),last(series.write),last(series.rx),last(series.tx));
+    }
+
+    // Init charts
+    makeCharts({cpu:$('cpuChart').getContext('2d'), mem:$('memChart').getContext('2d'),
+                disk:$('diskChart').getContext('2d'), net:$('netChart').getContext('2d')});
+    applyChartTheme();
+
+    // Controls
+    const sel=$('refreshMs'); startPolling(+sel.value);
+    sel.addEventListener('change',e=>startPolling(+e.target.value));
+    $('toggleMode').addEventListener('click', async ()=>{
+      mode=(mode==='mock')?'live':'mock';
+      $('modeBadge').textContent='MODE: '+mode.toUpperCase();
+      $('toggleMode').textContent = mode==='mock' ? 'Use LIVE' : 'Use MOCK';
+      await tick();
+    });
+    $('pauseBtn').addEventListener('click',()=>{
+      paused=!paused; $('pauseBtn').textContent = paused ? 'Resume' : 'Pause';
+      if(!paused) startPolling(+sel.value);
+    });
+    $('exportBtn').addEventListener('click',()=>{
+      const rows=['time,cpu_pct,mem_pct,disk_read_MBps,disk_write_MBps,net_rx_MBps,net_tx_MBps'];
+      const L=Math.min(series.t.length,series.cpu.length);
+      for(let i=Math.max(0,L-MAX_CHART);i<L;i++){
+        rows.push([series.t[i],series.cpu[i]?.toFixed?.(1),series.memory[i]?.toFixed?.(1),
+                   series.read[i]?.toFixed?.(4),series.write[i]?.toFixed?.(4),
+                   series.rx[i]?.toFixed?.(4),series.tx[i]?.toFixed?.(4)].join(','));
+      }
+      const blob=new Blob([rows.join('\n')],{type:'text/csv'}); const a=document.createElement('a');
+      a.href=URL.createObjectURL(blob); a.download='saaoe_timeseries.csv'; document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(a.href);
+    });
+
+    // Per-chart zoom (double click)
+    ['cpuWrap','memWrap','diskWrap','netWrap'].forEach(id=>{
+      const el=$(id);
+      el.addEventListener('dblclick',()=>{ el.dataset.zoom = el.dataset.zoom==='1'?'0':'1'; window.dispatchEvent(new Event('resize')); });
+    });
+
+    // Zoom All overlay
+    const overlay=$('zoomOverlay');
+    $('zoomAllBtn').addEventListener('click',()=>{
+      overlay.setAttribute('open','');
+      // build zoom charts with same data
+      const cZ = {cpu:$('cpuChartZ').getContext('2d'), mem:$('memChartZ').getContext('2d'),
+                  disk:$('diskChartZ').getContext('2d'), net:$('netChartZ').getContext('2d')};
+      const mk = (ctx,label,srcChart)=> new Chart(ctx,{type:'line',
+          data:{labels:srcChart.data.labels.slice(),datasets:srcChart.data.datasets.map(ds=>({label:ds.label,data:ds.data.slice(),borderColor:ds.borderColor,fill:false,tension:0.25}))},
+          options: baseOpts()});
+      cpuChartZ = mk(cZ.cpu,'CPU',cpuChart);
+      memChartZ = mk(cZ.mem,'Memory',memChart);
+      diskChartZ= mk(cZ.disk,'Disk',diskChart);
+      netChartZ = mk(cZ.net,'Net',netChart);
+      applyChartTheme();
+    });
+    const closeZoom=()=>{
+      overlay.removeAttribute('open');
+      [cpuChartZ,memChartZ,diskChartZ,netChartZ].forEach(ch=>{ if(ch){ ch.destroy(); }});
+      cpuChartZ=memChartZ=diskChartZ=netChartZ=null;
+    };
+    $('closeZoom').addEventListener('click',closeZoom);
+    overlay.addEventListener('click',e=>{ if(e.target===overlay) closeZoom(); });
+    window.addEventListener('keydown',e=>{ if(e.key==='Escape' && overlay.hasAttribute('open')) closeZoom(); });
+  });
+  </script>
+</body>
+</html>
